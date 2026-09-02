@@ -75,6 +75,7 @@ async function applyMemoryPatch(obj: Record<string, unknown>): Promise<void> {
     ["studyTopic", "study_topic"],
     ["startupNorthStar", "startup_north_star"],
     ["weekBet", "week_bet"],
+    ["nowFocus", "now_focus"],
   ];
   for (const [from, to] of map) {
     if (typeof obj[from] === "string" && obj[from]) {
@@ -83,5 +84,31 @@ async function applyMemoryPatch(obj: Record<string, unknown>): Promise<void> {
   }
   if (typeof obj.refusal === "string" && obj.refusal) {
     await addRefusal(String(obj.refusal));
+  }
+  if (obj.interest && typeof obj.interest === "object") {
+    const { loadLivePersona, persistPersona } = await import("./persona");
+    const persona = await loadLivePersona();
+    const patch = obj.interest as Record<string, unknown>;
+    const id = String(patch.id || "").trim();
+    if (id) {
+      const row = persona.interests.find((i) => i.id === id);
+      if (row) {
+        if (typeof patch.label === "string" && patch.label) row.label = patch.label;
+        if (typeof patch.note === "string" && patch.note) row.note = patch.note;
+        row.weight = Math.min(140, row.weight + 10);
+      } else {
+        persona.interests.push({
+          id,
+          label: String(patch.label || id),
+          weight: 40,
+          note: String(patch.note || ""),
+        });
+      }
+      persona.interests.sort((a, b) => b.weight - a.weight);
+      if (typeof obj.nowFocus === "string" && obj.nowFocus) {
+        persona.nowFocus = String(obj.nowFocus);
+      }
+      await persistPersona(persona);
+    }
   }
 }

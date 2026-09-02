@@ -3,10 +3,12 @@ import * as Notifications from "expo-notifications";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
+  Keyboard,
   KeyboardAvoidingView,
   Modal,
   Platform,
   Pressable,
+  SafeAreaView,
   ScrollView,
   StyleSheet,
   Text,
@@ -14,6 +16,7 @@ import {
   View,
 } from "react-native";
 import { askSteward, stripSpoken } from "./src/claude";
+import { createReplyStreamer } from "./src/streamSpeak";
 import {
   addMessage,
   answerCheckIn,
@@ -25,7 +28,6 @@ import {
   recentMessages,
   todayKey,
 } from "./src/db";
-import { FROM_EXPORT } from "./src/fromExport";
 import {
   nextBlockLabel,
   pendingFromNotification,
@@ -33,23 +35,39 @@ import {
   scheduleTestCheckIn,
 } from "./src/notifications";
 import { applyStewardPayloads } from "./src/payloads";
-import { idleLoad, MODEL_ID, warmSteward, type LoadState } from "./src/localLlm";
+import {
+  getLastInferenceStats,
+  idleLoad,
+  MODEL_ID,
+  warmSteward,
+  type LoadState,
+} from "./src/localLlm";
 import { PARAKEET_MODEL, warmParakeet } from "./src/parakeet";
 import { speak, useHoldToTalk } from "./src/speech";
+import {
+  learnFromUtterance,
+  loadLivePersona,
+  type LivePersona,
+} from "./src/persona";
+import { warmVoice } from "./src/voice";
 import type { Calling, ChatMessage, DayPlan, PendingOpen } from "./src/types";
 
-const CALLINGS: { id: Calling; label: string }[] = [
-  { id: "read", label: "Read" },
-  { id: "pray", label: "Pray" },
-  { id: "study", label: "Study" },
-  { id: "build", label: "Build" },
-];
+function callingForInterest(id: string): Calling {
+  if (id === "faith") return "pray";
+  if (id === "dissertation") return "study";
+  return "build";
+}
+
+function hourNow(): number {
+  return new Date().getHours();
+}
 
 export default function App() {
   const [ready, setReady] = useState(false);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [plan, setPlan] = useState<DayPlan | null>(null);
   const [bias, setBias] = useState<Calling | null>(null);
+  const [focusId, setFocusId] = useState<string | null>(null);
   const [muted, setMuted] = useState(false);
   const [draft, setDraft] = useState("");
   const [busy, setBusy] = useState(false);
@@ -57,7 +75,11 @@ export default function App() {
   const [settings, setSettings] = useState(false);
   const [model, setModel] = useState<LoadState>(idleLoad);
   const [stt, setStt] = useState<LoadState>(idleLoad);
+  const [lastHeard, setLastHeard] = useState("");
+  const [liveReply, setLiveReply] = useState("");
+  const [lastStats, setLastStats] = useState("");
   const [pending, setPending] = useState<PendingOpen | null>(null);
+  const [persona, setPersona] = useState<LivePersona | null>(null);
   const scrollRef = useRef<ScrollView>(null);
   const mutedRef = useRef(muted);
   mutedRef.current = muted;
@@ -70,34 +92,55 @@ export default function App() {
     ) => {
       const trimmed = text.trim();
       if (!trimmed || busy) return;
+      Keyboard.dismiss();
       setError("");
       if (Platform.OS === "web") {
-        setError("Steward runs on your phone, fully on-device. Use the iOS or Android build.");
+        setError("On-device only. Open the phone build.");
         return;
       }
       if (model.phase !== "ready") {
-        setError(model.message || "Wait for the on-device model to finish loading.");
+        setError(model.message || "Still loading.");
         return;
       }
       setBusy(true);
+      setLiveReply("");
       setDraft("");
-      await addMessage("user", trimmed);
+      const learned = await learnFromUtterance(trimmed);
+      setPersona(learned);
+      const userMsgId = await addMessage("user", trimmed);
       setMessages((m) => [
         ...m,
-        { role: "user", content: trimmed, createdAt: new Date().toISOString() },
+        {
+          id: userMsgId,
+          role: "user",
+          content: trimmed,
+          createdAt: new Date().toISOString(),
+        },
       ]);
       try {
-        const history = await recentMessages(20);
+        const history = await recentMessages(8);
+        const streamer = createReplyStreamer(mutedRef.current);
         const reply = await askSteward({
           userText: trimmed,
           history: history.slice(0, -1),
           callingBias: bias,
           mode,
-          fromExport: FROM_EXPORT,
           extra,
+          onToken: (token) => {
+            streamer.onToken(token);
+            setLiveReply((s) => s + token);
+          },
         });
-        await addMessage("assistant", reply);
+        streamer.finish();
+        const stats = getLastInferenceStats();
+        if (stats) {
+          setLastStats(
+            `TTFT ${Math.round(stats.timeToFirstTokenMs)}ms · ${stats.decodeTps.toFixed(0)} tok/s`
+          );
+        }
+        const assistantMsgId = await addMessage("assistant", reply);
         await applyStewardPayloads(reply);
+        setPersona(await loadLivePersona());
         if (
           (mode === "checkin" || pending?.kind === "checkin" || pending?.kind === "followup") &&
           pending?.blockId
@@ -105,18 +148,19 @@ export default function App() {
           const row = await pendingCheckInForBlock(todayKey(), pending.blockId);
           if (row) await answerCheckIn(row.id, trimmed);
         }
-        const spoken = stripSpoken(reply);
         setMessages((m) => [
           ...m,
           {
+            id: assistantMsgId,
             role: "assistant",
             content: reply,
             createdAt: new Date().toISOString(),
           },
         ]);
-        speak(spoken, mutedRef.current);
+        setLiveReply("");
         setPlan(await getDayPlan(todayKey()));
       } catch (e) {
+        setLiveReply("");
         setError(e instanceof Error ? e.message : "Steward failed");
       } finally {
         setBusy(false);
@@ -129,20 +173,29 @@ export default function App() {
   sendRef.current = send;
 
   const { listening, partial, start, stop } = useHoldToTalk((transcript) => {
-    void sendRef.current(transcript, pending?.kind === "checkin" || pending?.kind === "followup" ? "checkin" : "chat");
+    setLastHeard(transcript);
+    const mode =
+      pending?.kind === "checkin" || pending?.kind === "followup" ? "checkin" : "chat";
+    void sendRef.current(transcript, mode);
   });
+
+  useEffect(() => {
+    return () => {};
+  }, []);
 
   useEffect(() => {
     void (async () => {
       await kvSet("last_heard_at", new Date().toISOString());
-      const [msgs, p, mute] = await Promise.all([
+      const [msgs, p, mute, live] = await Promise.all([
         recentMessages(30),
         getDayPlan(todayKey()),
         kvGet("muted"),
+        loadLivePersona(),
       ]);
       setMessages(msgs);
       setPlan(p);
       setMuted(mute === "1");
+      setPersona(live);
       await scheduleDailyBeats();
       if (Platform.OS !== "web") {
         try {
@@ -176,10 +229,11 @@ export default function App() {
       setStt({
         phase: "error",
         pct: 0,
-        message: "Parakeet STT is on-device only.",
+        message: "Listen is on-device only.",
       });
       return;
     }
+    void warmVoice();
     void warmSteward(setModel).catch((e) =>
       setModel({
         phase: "error",
@@ -191,333 +245,417 @@ export default function App() {
       setStt({
         phase: "error",
         pct: 0,
-        message: e instanceof Error ? e.message : "Parakeet failed",
+        message: e instanceof Error ? e.message : "Listen failed",
       })
     );
   }, []);
 
   useEffect(() => {
-    if (!ready || !pending) return;
+    if (!ready || !pending || !persona) return;
     const run = async () => {
       const mem = await loadMemorySnapshot();
       if (pending.kind === "morning") {
-        speak(
-          "Good morning. Hold the mic and we'll plan the day — or tap Plan today.",
-          mutedRef.current
-        );
+        speak(`Morning. ${persona.nowFocus}. Hold, and we'll cut the day.`, mutedRef.current);
         return;
       }
       if (pending.kind === "recap") {
-        speak(
-          "When you're ready, we'll recap. Tap Recap tonight, or hold the mic.",
-          mutedRef.current
-        );
+        speak("Hold when you want the recap.", mutedRef.current);
         return;
       }
       const prompt =
         pending.prompt ||
         mem.todayPlan?.blocks.find((b) => b.id === pending.blockId)?.outcome ||
-        "How is this block going?";
+        persona.nowFocus;
       speak(prompt, mutedRef.current);
     };
     void run();
-  }, [ready, pending]);
+  }, [ready, pending, persona]);
 
-  const lastSpoken = useMemo(() => {
+  const spoken = useMemo(() => {
+    if (liveReply) return stripSpoken(liveReply) || "…";
     const last = [...messages].reverse().find((m) => m.role === "assistant");
-    return last ? stripSpoken(last.content) : "Hold the mic. I'll listen, then speak.";
-  }, [messages]);
+    if (last) return stripSpoken(last.content);
+    return persona
+      ? `${persona.nowFocus}. Hold, and we'll take the next inch.`
+      : "";
+  }, [liveReply, messages, persona]);
+
+  const hour = hourNow();
+  const showPlan = hour < 11 && !plan;
+  const showRecap = hour >= 20;
+  const status =
+    listening
+      ? "Listening"
+      : partial.startsWith("Transcribing")
+        ? partial
+        : lastHeard && busy
+          ? lastHeard
+          : nextBlockLabel(plan);
+  const readyMind = model.phase === "ready" && stt.phase === "ready";
 
   if (!ready) {
     return (
-      <View style={[styles.screen, styles.center]}>
-        <ActivityIndicator color="#C4A574" />
+      <View style={[styles.safe, styles.center]}>
+        <ActivityIndicator color="#C9B896" />
       </View>
     );
   }
 
   return (
-    <KeyboardAvoidingView
-      style={styles.screen}
-      behavior={Platform.OS === "ios" ? "padding" : undefined}
-    >
-      <StatusBar style="light" />
-      <View style={styles.top}>
-        <View>
+    <SafeAreaView style={styles.safe}>
+      <KeyboardAvoidingView
+        style={styles.screen}
+        behavior={Platform.OS === "ios" ? "padding" : undefined}
+      >
+        <StatusBar style="light" />
+
+        <View style={styles.nav}>
           <Text style={styles.wordmark}>Steward</Text>
-          <Text style={styles.planStrip}>{nextBlockLabel(plan)}</Text>
-          <Text style={styles.modelLine}>
-            {model.phase === "ready"
-              ? `Mind · ${MODEL_ID}`
-              : model.message}
-          </Text>
-          <Text style={styles.modelLine}>
-            {stt.phase === "ready"
-              ? `Listen · NVIDIA Parakeet (${PARAKEET_MODEL})`
-              : stt.message}
-          </Text>
-        </View>
-        <Pressable onPress={() => setSettings(true)} hitSlop={12} accessibilityLabel="Settings">
-          <Text style={styles.gear}>Settings</Text>
-        </Pressable>
-      </View>
-
-      <View style={styles.chips}>
-        {CALLINGS.map((c) => (
-          <Pressable
-            key={c.id}
-            onPress={() => setBias((b) => (b === c.id ? null : c.id))}
-            style={[styles.chip, bias === c.id && styles.chipOn]}
-            accessibilityLabel={c.label}
-          >
-            <Text style={[styles.chipText, bias === c.id && styles.chipTextOn]}>
-              {c.label}
-            </Text>
-          </Pressable>
-        ))}
-      </View>
-
-      <ScrollView
-        ref={scrollRef}
-        style={styles.thread}
-        contentContainerStyle={styles.threadInner}
-        onContentSizeChange={() => scrollRef.current?.scrollToEnd({ animated: true })}
-      >
-        {messages.map((m, i) => (
-          <View
-            key={m.id ?? i}
-            style={[styles.bubble, m.role === "user" ? styles.user : styles.assistant]}
-          >
-            <Text style={styles.bubbleText}>
-              {m.role === "assistant" ? stripSpoken(m.content) : m.content}
-            </Text>
-          </View>
-        ))}
-        {listening && partial ? (
-          <Text style={styles.partial}>{partial}</Text>
-        ) : null}
-      </ScrollView>
-
-      <Text style={styles.lastLine}>{lastSpoken}</Text>
-      {error ? <Text style={styles.error}>{error}</Text> : null}
-
-      <View style={styles.actions}>
-        <Pressable
-          style={styles.smallBtn}
-          accessibilityLabel="Plan today"
-          onPress={() =>
-            void send(
-              "Plan today across read, pray, study, and build. Leave slack.",
-              "plan"
-            )
-          }
-        >
-          <Text style={styles.smallBtnText}>Plan today</Text>
-        </Pressable>
-        <Pressable
-          style={styles.smallBtn}
-          accessibilityLabel="Recap tonight"
-          onPress={() =>
-            void send(
-              "Night recap: what we kept, what slipped, tomorrow's first move.",
-              "recap"
-            )
-          }
-        >
-          <Text style={styles.smallBtnText}>Recap tonight</Text>
-        </Pressable>
-        <Pressable
-          style={styles.smallBtn}
-          accessibilityLabel={muted ? "Voice off" : "Voice on"}
-          onPress={async () => {
-            const next = !muted;
-            setMuted(next);
-            await kvSet("muted", next ? "1" : "0");
-          }}
-        >
-          <Text style={styles.smallBtnText}>{muted ? "Voice off" : "Voice on"}</Text>
-        </Pressable>
-      </View>
-
-      <View style={styles.composer}>
-        <TextInput
-          style={styles.input}
-          value={draft}
-          onChangeText={setDraft}
-          placeholder="Type if you can't talk…"
-          placeholderTextColor="#6F6A64"
-          onSubmitEditing={() => void send(draft)}
-          returnKeyType="send"
-        />
-        <Pressable
-          style={styles.send}
-          onPress={() => void send(draft)}
-          disabled={busy}
-          accessibilityLabel="Send"
-        >
-          <Text style={styles.sendText}>Send</Text>
-        </Pressable>
-      </View>
-
-      <Pressable
-        onPressIn={() => void start()}
-        onPressOut={stop}
-        style={[styles.mic, listening && styles.micOn]}
-        accessibilityLabel="Hold to talk"
-      >
-        <Text style={styles.micText}>{listening ? "Listening…" : "Hold to talk"}</Text>
-      </Pressable>
-
-      {busy ? (
-        <View style={styles.busy}>
-          <ActivityIndicator color="#C4A574" />
-        </View>
-      ) : null}
-
-      <Modal visible={settings} animationType="slide" transparent>
-        <View style={styles.modalWrap}>
-          <View style={styles.modal}>
-            <Text style={styles.wordmark}>Settings</Text>
-            <Text style={styles.hint}>
-              No cloud LLMs and no cloud speech. Cactus runs NVIDIA Parakeet on this phone.
-              The STT model downloads once, then works offline. Telemetry and cloud handoff
-              are off.
-            </Text>
-            <Text style={styles.hint}>{model.message}</Text>
-            <Text style={styles.hint}>{stt.message}</Text>
-            {model.phase === "downloading" ||
-            model.phase === "loading" ||
-            stt.phase === "downloading" ||
-            stt.phase === "loading" ? (
-              <ActivityIndicator color="#C4A574" />
-            ) : null}
-            {model.phase === "error" && Platform.OS !== "web" ? (
-              <Pressable
-                style={styles.smallBtn}
-                accessibilityLabel="Retry model"
-                onPress={() =>
-                  void warmSteward(setModel).catch((e) =>
-                    setModel({
-                      phase: "error",
-                      pct: 0,
-                      message: e instanceof Error ? e.message : "Model failed",
-                    })
-                  )
-                }
-              >
-                <Text style={styles.smallBtnText}>Retry on-device model</Text>
-              </Pressable>
-            ) : null}
-            {stt.phase === "error" && Platform.OS !== "web" ? (
-              <Pressable
-                style={styles.smallBtn}
-                accessibilityLabel="Retry Parakeet"
-                onPress={() =>
-                  void warmParakeet(setStt).catch((e) =>
-                    setStt({
-                      phase: "error",
-                      pct: 0,
-                      message: e instanceof Error ? e.message : "Parakeet failed",
-                    })
-                  )
-                }
-              >
-                <Text style={styles.smallBtnText}>Retry Parakeet STT</Text>
-              </Pressable>
-            ) : null}
+          <View style={styles.navRight}>
             <Pressable
-              style={styles.smallBtn}
-              accessibilityLabel="Test check-in in 5s"
-              onPress={() =>
-                void scheduleTestCheckIn("Build block — still on the next ship?")
-              }
+              onPress={async () => {
+                const next = !muted;
+                setMuted(next);
+                await kvSet("muted", next ? "1" : "0");
+              }}
+              hitSlop={10}
+              accessibilityLabel={muted ? "Voice off" : "Voice on"}
             >
-              <Text style={styles.smallBtnText}>Test check-in in 5s</Text>
+              <Text style={styles.navLink}>{muted ? "Silent" : "Voice"}</Text>
             </Pressable>
-            <Pressable onPress={() => setSettings(false)} accessibilityLabel="Close settings">
-              <Text style={styles.gear}>Close</Text>
+            <Pressable onPress={() => setSettings(true)} hitSlop={10} accessibilityLabel="Settings">
+              <Text style={styles.navLink}>Settings</Text>
             </Pressable>
           </View>
         </View>
-      </Modal>
-    </KeyboardAvoidingView>
+
+        <Pressable style={styles.now} accessibilityLabel={persona?.nowFocus ?? "Focus"}>
+          <Text style={styles.nowKicker}>{persona?.givenName}</Text>
+          <Text style={styles.nowTitle}>{persona?.nowFocus}</Text>
+          {status ? <Text style={styles.nowMeta}>{status}</Text> : null}
+        </Pressable>
+
+        <View style={styles.pills}>
+          {(persona?.interests ?? []).slice(0, 4).map((i) => (
+            <Pressable
+              key={i.id}
+              onPress={() => {
+                const on = focusId === i.id;
+                setFocusId(on ? null : i.id);
+                setBias(on ? null : callingForInterest(i.id));
+              }}
+              style={[styles.pill, focusId === i.id && styles.pillOn]}
+              accessibilityLabel={i.label}
+            >
+              <Text style={[styles.pillText, focusId === i.id && styles.pillTextOn]}>
+                {i.label}
+              </Text>
+            </Pressable>
+          ))}
+        </View>
+
+        <ScrollView
+          ref={scrollRef}
+          style={styles.heroScroll}
+          contentContainerStyle={styles.heroInner}
+          keyboardShouldPersistTaps="handled"
+          onContentSizeChange={() => scrollRef.current?.scrollToEnd({ animated: true })}
+        >
+          <Text style={styles.hero}>{spoken}</Text>
+          {error ? <Text style={styles.error}>{error}</Text> : null}
+        </ScrollView>
+
+        <View style={styles.dock}>
+          {(showPlan || showRecap) && (
+            <View style={styles.rituals}>
+              {showPlan ? (
+                <Pressable
+                  onPress={() =>
+                    void send("Plan today. First 10 users first. Leave slack.", "plan")
+                  }
+                  accessibilityLabel="Plan"
+                >
+                  <Text style={styles.ritual}>Plan</Text>
+                </Pressable>
+              ) : null}
+              {showRecap ? (
+                <Pressable
+                  onPress={() =>
+                    void send("Night recap. Kept, slipped, tomorrow first.", "recap")
+                  }
+                  accessibilityLabel="Recap"
+                >
+                  <Text style={styles.ritual}>Recap</Text>
+                </Pressable>
+              ) : null}
+            </View>
+          )}
+
+          <View style={[styles.composerBar, listening && styles.composerBarActive]}>
+            <TextInput
+              style={styles.input}
+              value={draft}
+              onChangeText={setDraft}
+              placeholder={listening ? "Listening…" : "Ask, plan, or reflect…"}
+              placeholderTextColor="#686258"
+              onSubmitEditing={() => void send(draft)}
+              returnKeyType="send"
+              editable={!listening}
+            />
+            {draft.trim().length > 0 ? (
+              <Pressable
+                onPress={() => void send(draft)}
+                disabled={busy}
+                accessibilityLabel="Send"
+                style={styles.sendBtn}
+              >
+                <Text style={[styles.sendText, busy && styles.sendDisabled]}>Send</Text>
+              </Pressable>
+            ) : (
+              <Pressable
+                onPressIn={() => void start()}
+                onPressOut={stop}
+                disabled={!readyMind}
+                style={[
+                  styles.micBtn,
+                  listening && styles.micBtnOn,
+                  !readyMind && styles.micBtnWait,
+                ]}
+                accessibilityLabel="Hold to talk"
+              >
+                <View style={[styles.micDotSmall, listening && styles.micDotSmallOn]} />
+                <Text style={[styles.micBtnText, listening && styles.micBtnTextOn]}>
+                  {!readyMind ? "…" : listening ? "Release" : "Hold"}
+                </Text>
+              </Pressable>
+            )}
+          </View>
+        </View>
+
+        {busy ? (
+          <View style={styles.busy}>
+            <ActivityIndicator color="#C9B896" />
+          </View>
+        ) : null}
+
+        <Modal visible={settings} animationType="slide" transparent>
+          <View style={styles.modalWrap}>
+            <ScrollView contentContainerStyle={styles.modal} keyboardShouldPersistTaps="handled">
+              <Text style={styles.wordmark}>On this phone</Text>
+              <Text style={styles.hint}>{model.message}</Text>
+              <Text style={styles.hint}>{stt.message}</Text>
+              {lastStats ? <Text style={styles.hint}>{lastStats}</Text> : null}
+              <Text style={styles.hint}>
+                Persona grows from what you say. Nothing leaves the device.
+              </Text>
+              {(model.phase === "downloading" || stt.phase === "downloading") && (
+                <ActivityIndicator color="#C9B896" />
+              )}
+              {model.phase === "error" && Platform.OS !== "web" ? (
+                <Pressable
+                  style={styles.smallBtn}
+                  onPress={() =>
+                    void warmSteward(setModel).catch((e) =>
+                      setModel({
+                        phase: "error",
+                        pct: 0,
+                        message: e instanceof Error ? e.message : "Model failed",
+                      })
+                    )
+                  }
+                >
+                  <Text style={styles.ritual}>Retry mind</Text>
+                </Pressable>
+              ) : null}
+              {stt.phase === "error" && Platform.OS !== "web" ? (
+                <Pressable
+                  style={styles.smallBtn}
+                  onPress={() =>
+                    void warmParakeet(setStt).catch((e) =>
+                      setStt({
+                        phase: "error",
+                        pct: 0,
+                        message: e instanceof Error ? e.message : "Listen failed",
+                      })
+                    )
+                  }
+                >
+                  <Text style={styles.ritual}>Retry listen</Text>
+                </Pressable>
+              ) : null}
+              <Pressable
+                style={styles.smallBtn}
+                onPress={() => void scheduleTestCheckIn(persona?.nowFocus || "Still on it?")}
+              >
+                <Text style={styles.ritual}>Ping in 5s</Text>
+              </Pressable>
+              <Pressable onPress={() => setSettings(false)} accessibilityLabel="Close">
+                <Text style={styles.navLink}>Close</Text>
+              </Pressable>
+            </ScrollView>
+          </View>
+        </Modal>
+      </KeyboardAvoidingView>
+    </SafeAreaView>
   );
 }
 
 const styles = StyleSheet.create({
-  screen: { flex: 1, backgroundColor: "#0E1114", paddingTop: 56, paddingHorizontal: 16 },
+  safe: { flex: 1, backgroundColor: "#0B0C0E" },
+  screen: {
+    flex: 1,
+    paddingHorizontal: 22,
+    paddingBottom: Platform.OS === "android" ? 16 : 8,
+    minHeight: 0,
+  },
   center: { alignItems: "center", justifyContent: "center" },
-  top: { flexDirection: "row", justifyContent: "space-between", alignItems: "flex-start" },
-  wordmark: { color: "#E8E4DC", fontSize: 22, fontWeight: "600", letterSpacing: 0.4 },
-  planStrip: { color: "#C4A574", marginTop: 4, fontSize: 13, maxWidth: 260 },
-  modelLine: { color: "#8B8680", marginTop: 4, fontSize: 11, maxWidth: 280 },
-  gear: { color: "#8B8680", fontSize: 13, marginTop: 6 },
-  chips: { flexDirection: "row", gap: 8, marginTop: 16 },
-  chip: {
-    borderColor: "#2A3138",
+  nav: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    paddingTop: 4,
+  },
+  navRight: { flexDirection: "row", gap: 18 },
+  wordmark: {
+    color: "#EDE6D6",
+    fontSize: 17,
+    fontWeight: "500",
+    letterSpacing: 3,
+    textTransform: "uppercase",
+  },
+  navLink: { color: "#8A8478", fontSize: 13 },
+  now: { marginTop: 20 },
+  nowKicker: {
+    color: "#8A8478",
+    fontSize: 12,
+    letterSpacing: 1.4,
+    textTransform: "uppercase",
+  },
+  nowTitle: {
+    color: "#EDE6D6",
+    fontSize: 24,
+    fontWeight: "300",
+    letterSpacing: -0.4,
+    marginTop: 4,
+    lineHeight: 30,
+  },
+  nowMeta: { color: "#C9B896", marginTop: 8, fontSize: 13 },
+  pills: { flexDirection: "row", flexWrap: "wrap", gap: 8, marginTop: 14 },
+  pill: {
+    borderColor: "#2A2C2E",
     borderWidth: 1,
-    borderRadius: 20,
+    borderRadius: 999,
     paddingHorizontal: 12,
     paddingVertical: 6,
   },
-  chipOn: { backgroundColor: "#C4A574", borderColor: "#C4A574" },
-  chipText: { color: "#E8E4DC", fontSize: 13 },
-  chipTextOn: { color: "#0E1114", fontWeight: "600" },
-  thread: { flex: 1, marginTop: 16 },
-  threadInner: { paddingBottom: 12, gap: 8 },
-  bubble: { borderRadius: 12, padding: 10, maxWidth: "92%" },
-  user: { alignSelf: "flex-end", backgroundColor: "#243018" },
-  assistant: { alignSelf: "flex-start", backgroundColor: "#1A1F24" },
-  bubbleText: { color: "#E8E4DC", fontSize: 15, lineHeight: 21 },
-  partial: { color: "#8B8680", fontStyle: "italic", marginTop: 8 },
-  lastLine: { color: "#8B8680", fontSize: 12, marginTop: 4 },
-  error: { color: "#D9786A", fontSize: 12, marginTop: 6 },
-  actions: { flexDirection: "row", gap: 8, marginTop: 10, flexWrap: "wrap" },
-  smallBtn: {
-    borderColor: "#2A3138",
-    borderWidth: 1,
-    borderRadius: 8,
-    paddingHorizontal: 10,
-    paddingVertical: 8,
+  pillOn: { backgroundColor: "#C9B896", borderColor: "#C9B896" },
+  pillText: { color: "#C4BBA8", fontSize: 12 },
+  pillTextOn: { color: "#0B0C0E", fontWeight: "600" },
+  heroScroll: { flex: 1, minHeight: 0, marginTop: 18 },
+  heroInner: { flexGrow: 1, justifyContent: "center", paddingBottom: 8 },
+  hero: {
+    color: "#EDE6D6",
+    fontSize: 20,
+    fontWeight: "300",
+    lineHeight: 28,
+    letterSpacing: -0.2,
   },
-  smallBtnText: { color: "#E8E4DC", fontSize: 13 },
-  composer: { flexDirection: "row", gap: 8, marginTop: 10, alignItems: "center" },
+  error: { color: "#C97B6E", fontSize: 13, marginTop: 12 },
+  dock: {
+    paddingTop: 8,
+    paddingBottom: Platform.OS === "android" ? 16 : 8,
+    flexShrink: 0,
+    width: "100%",
+  },
+  rituals: { flexDirection: "row", gap: 28, marginBottom: 12, justifyContent: "center" },
+  ritual: { color: "#C9B896", fontSize: 14, letterSpacing: 0.6 },
+  composerBar: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: "#14171A",
+    borderColor: "#262B30",
+    borderWidth: 1,
+    borderRadius: 24,
+    paddingLeft: 16,
+    paddingRight: 6,
+    paddingVertical: 4,
+    minHeight: 48,
+  },
+  composerBarActive: {
+    borderColor: "#C9B896",
+    backgroundColor: "#1F1C16",
+  },
   input: {
     flex: 1,
-    color: "#E8E4DC",
-    borderColor: "#2A3138",
-    borderWidth: 1,
-    borderRadius: 10,
-    paddingHorizontal: 12,
-    paddingVertical: 10,
+    color: "#EDE6D6",
+    fontSize: 15,
+    paddingVertical: 8,
+    paddingRight: 8,
   },
-  send: { paddingHorizontal: 12, paddingVertical: 10 },
-  sendText: { color: "#C4A574", fontWeight: "600" },
-  mic: {
-    marginTop: 12,
-    marginBottom: 24,
-    backgroundColor: "#1A1F24",
-    borderRadius: 28,
-    paddingVertical: 18,
+  sendBtn: {
+    backgroundColor: "#C9B896",
+    borderRadius: 18,
+    paddingHorizontal: 16,
+    paddingVertical: 8,
     alignItems: "center",
-    borderWidth: 1,
-    borderColor: "#C4A574",
+    justifyContent: "center",
   },
-  micOn: { backgroundColor: "#3A2E1C" },
-  micText: { color: "#C4A574", fontSize: 16, fontWeight: "600" },
-  busy: { position: "absolute", top: 64, right: 20 },
+  sendText: {
+    color: "#0B0C0E",
+    fontSize: 13,
+    fontWeight: "700",
+    letterSpacing: 0.4,
+  },
+  sendDisabled: { opacity: 0.5 },
+  micBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    backgroundColor: "#202428",
+    borderColor: "#323840",
+    borderWidth: 1,
+    borderRadius: 18,
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+  },
+  micBtnOn: {
+    backgroundColor: "#3A2E1A",
+    borderColor: "#C9B896",
+  },
+  micBtnWait: { opacity: 0.45 },
+  micDotSmall: {
+    width: 6,
+    height: 6,
+    borderRadius: 3,
+    backgroundColor: "#C9B896",
+  },
+  micDotSmallOn: {
+    backgroundColor: "#EDE6D6",
+  },
+  micBtnText: {
+    color: "#C9B896",
+    fontSize: 12,
+    fontWeight: "600",
+    letterSpacing: 0.6,
+    textTransform: "uppercase",
+  },
+  micBtnTextOn: {
+    color: "#EDE6D6",
+  },
+  busy: { position: "absolute", top: 20, right: 22 },
   modalWrap: {
     flex: 1,
-    backgroundColor: "rgba(0,0,0,0.55)",
+    backgroundColor: "rgba(0,0,0,0.62)",
     justifyContent: "flex-end",
   },
   modal: {
-    backgroundColor: "#14181C",
-    padding: 20,
-    paddingBottom: 36,
-    gap: 12,
-    borderTopLeftRadius: 16,
-    borderTopRightRadius: 16,
+    backgroundColor: "#121416",
+    padding: 24,
+    paddingBottom: 40,
+    gap: 14,
+    borderTopLeftRadius: 20,
+    borderTopRightRadius: 20,
   },
-  hint: { color: "#8B8680", fontSize: 13, lineHeight: 18 },
+  hint: { color: "#8A8478", fontSize: 14, lineHeight: 20 },
+  smallBtn: { paddingVertical: 8 },
 });

@@ -1,7 +1,5 @@
-export const MODEL_ID = "Llama-3.2-1B-Instruct-Q4_K_M";
-export const MODEL_FILE = `${MODEL_ID}.gguf`;
-export const MODEL_URL =
-  "https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q4_K_M.gguf";
+export const MODEL_ID = "gemma-3-270m-it";
+export const FALLBACK_MODEL_ID = "qwen3-0.6b";
 
 export type LoadPhase =
   | "idle"

@@ -4,7 +4,7 @@ Voice companion for a Christian day: **listen**, **speak**, **plan the morning**
 
 Everything runs **on the device**. No cloud LLMs and no cloud speech APIs.
 
-- **Mind:** Llama 3.2 1B Instruct via [llama.rn](https://github.com/mybigday/llama.rn)
+- **Mind:** Gemma 3 270M Instruct via [Cactus Compute](https://cactuscompute.com) (`cactus-react-native`)
 - **Listen:** NVIDIA Parakeet CTC 1.1B via [Cactus Compute](https://cactuscompute.com) (`cactus-react-native`)
 - **Speak:** on-device TTS (`expo-speech`)
 

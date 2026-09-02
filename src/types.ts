@@ -36,6 +36,8 @@ export type MemorySnapshot = {
   studyTopic: string;
   startupNorthStar: string;
   weekBet: string;
+  nowFocus: string;
+  interests: { id: string; label: string; weight: number }[];
   refusals: string[];
   todayPlan: DayPlan | null;
   lastRecap: RecapRecord | null;

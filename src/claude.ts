@@ -1,6 +1,7 @@
-import { JSON_CONTRACT, STEWARD_CONSTITUTION, UNKNOWNS } from "./constitution";
+import { JSON_CONTRACT, STEWARD_INFERENCE } from "./constitution";
 import { loadMemorySnapshot } from "./db";
 import { completeChat } from "./localLlm";
+import { loadLivePersona, promptBlock } from "./persona";
 import type { Calling, MemorySnapshot } from "./types";
 
 export function stripSpoken(text: string): string {
@@ -31,56 +32,48 @@ export function extractJsonObjects(text: string): Record<string, unknown>[] {
   return objects;
 }
 
+function clip(s: string, n: number): string {
+  const t = s.trim();
+  return t.length <= n ? t : t.slice(0, n - 1) + "…";
+}
+
 function snapshotBlock(s: MemorySnapshot): string {
-  return [
-    `Book: ${s.book || "(unknown)"} @ ${s.bookPlace || "?"}`,
-    `Prayer theme: ${s.prayerTheme || "(unknown)"}`,
-    `Study: ${s.studyTopic || "(unknown)"}`,
-    `Startup: ${s.startupNorthStar || "(unknown)"}`,
-    `This week's bet: ${s.weekBet || "(unknown)"}`,
-    `Refused: ${s.refusals.join("; ") || "none"}`,
-    `Yesterday recap: ${
-      s.lastRecap
-        ? `kept=${s.lastRecap.kept}; slipped=${s.lastRecap.slipped}; tomorrow=${s.lastRecap.tomorrowFirst}`
-        : "none"
-    }`,
-    `Today's plan: ${s.todayPlan ? JSON.stringify(s.todayPlan) : "none yet"}`,
-    `Today's check-ins: ${
-      s.checkInAnswers.length
-        ? s.checkInAnswers.map((c) => `${c.prompt} → ${c.answer}`).join("; ")
-        : "none"
-    }`,
-  ].join("\n");
+  const lines: string[] = [];
+  if (s.nowFocus) lines.push(`Focus: ${s.nowFocus}`);
+  if (s.book) lines.push(`Book: ${s.book}${s.bookPlace ? ` @ ${s.bookPlace}` : ""}`);
+  if (s.prayerTheme) lines.push(`Prayer: ${s.prayerTheme}`);
+  if (s.studyTopic) lines.push(`Study: ${clip(s.studyTopic, 120)}`);
+  if (s.startupNorthStar) lines.push(`Startup: ${s.startupNorthStar}`);
+  if (s.weekBet) lines.push(`Week: ${s.weekBet}`);
+  if (s.refusals.length) lines.push(`Refused: ${s.refusals.join("; ")}`);
+  if (s.lastRecap) {
+    lines.push(`Yesterday: ${clip(s.lastRecap.tomorrowFirst || s.lastRecap.kept, 80)}`);
+  }
+  if (s.todayPlan) {
+    lines.push(
+      `Today: ${s.todayPlan.blocks.map((b) => `${b.start} ${b.calling}`).join("; ")}`
+    );
+  }
+  return lines.join("\n");
 }
 
 export async function buildSystemPrompt(opts: {
   callingBias: Calling | null;
   mode: "chat" | "plan" | "checkin" | "recap";
-  fromExport: string;
   extra?: string;
 }): Promise<string> {
-  const memory = await loadMemorySnapshot();
-  const exportBit = opts.fromExport.replace("_No export ingested yet._", "").slice(0, 800);
+  const [memory, persona] = await Promise.all([loadMemorySnapshot(), loadLivePersona()]);
   const parts = [
-    STEWARD_CONSTITUTION,
-    JSON_CONTRACT,
-    UNKNOWNS,
-    "## Memory now\n" + snapshotBlock(memory),
-    exportBit ? "## From Claude export\n" + exportBit : "",
-    opts.callingBias
-      ? `Bias this turn toward: ${opts.callingBias} (still suggest one action).`
-      : "",
-    opts.mode === "plan"
-      ? "This turn is MORNING PLAN. Speak a tight plan covering read, pray, study, and build with times. Then emit day_plan JSON."
-      : "",
-    opts.mode === "checkin"
-      ? "This turn is a CHECK-IN. Speak one short question about the current block. Listen for done / slipped / smaller step / not now."
-      : "",
-    opts.mode === "recap"
-      ? "This turn is NIGHT RECAP. Speak ~30 seconds: kept, slipped, tomorrow's first move. Then emit recap JSON."
-      : "",
+    STEWARD_INFERENCE,
+    promptBlock(persona),
+    snapshotBlock(memory),
+    opts.mode === "plan" || opts.mode === "recap" ? JSON_CONTRACT : "",
+    opts.callingBias ? `Lean ${opts.callingBias}. One action.` : "",
+    opts.mode === "plan" ? "Morning plan. Spoken first, then day_plan JSON." : "",
+    opts.mode === "checkin" ? "One spoken line. No JSON." : "",
+    opts.mode === "recap" ? "Night recap, ~20s spoken, then recap JSON." : "",
+    opts.mode === "chat" ? "One or two spoken sentences. No JSON unless you learned a new fact." : "",
     opts.extra ?? "",
-    "You run fully on-device. Be brief.",
   ];
   return parts.filter(Boolean).join("\n\n");
 }
@@ -90,22 +83,25 @@ export async function askSteward(input: {
   history: { role: "user" | "assistant"; content: string }[];
   callingBias: Calling | null;
   mode: "chat" | "plan" | "checkin" | "recap";
-  fromExport: string;
   extra?: string;
+  onToken?: (token: string) => void;
 }): Promise<string> {
   const system = await buildSystemPrompt({
     callingBias: input.callingBias,
     mode: input.mode,
-    fromExport: input.fromExport,
     extra: input.extra,
   });
   const messages = [
-    ...input.history.slice(-8).map((m) => ({
+    ...input.history.slice(-4).map((m) => ({
       role: m.role as "user" | "assistant",
-      content: m.role === "assistant" ? stripSpoken(m.content) : m.content,
+      content: clip(
+        m.role === "assistant" ? stripSpoken(m.content) : m.content,
+        220
+      ),
     })),
-    { role: "user" as const, content: input.userText },
+    { role: "user" as const, content: clip(input.userText, 400) },
   ];
-  const nPredict = input.mode === "plan" || input.mode === "recap" ? 700 : 350;
-  return completeChat({ system, messages, nPredict });
+  const nPredict =
+    input.mode === "plan" ? 160 : input.mode === "recap" ? 120 : input.mode === "checkin" ? 48 : 56;
+  return completeChat({ system, messages, nPredict, onToken: input.onToken });
 }

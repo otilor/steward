@@ -77,12 +77,13 @@ export async function kvSet(key: string, value: string): Promise<void> {
 export async function addMessage(
   role: "user" | "assistant",
   content: string
-): Promise<void> {
+): Promise<number> {
   const database = await getDb();
-  await database.runAsync(
+  const result = await database.runAsync(
     "INSERT INTO messages (role, content, created_at) VALUES (?, ?, ?)",
     [role, content, new Date().toISOString()]
   );
+  return Number(result.lastInsertRowId);
 }
 
 export async function recentMessages(limit = 24): Promise<ChatMessage[]> {
@@ -256,6 +257,8 @@ export async function loadMemorySnapshot(): Promise<import("./types").MemorySnap
     todayPlan,
     lastRecap,
     checkInAnswers,
+    nowFocus,
+    interestsRaw,
   ] = await Promise.all([
     kvGet("book"),
     kvGet("book_place"),
@@ -267,7 +270,15 @@ export async function loadMemorySnapshot(): Promise<import("./types").MemorySnap
     getDayPlan(date),
     yesterdayRecap(),
     checkInAnswersForDate(date),
+    kvGet("now_focus"),
+    kvGet("interests_json"),
   ]);
+  let interests: import("./types").MemorySnapshot["interests"] = [];
+  try {
+    if (interestsRaw) interests = JSON.parse(interestsRaw);
+  } catch {
+    interests = [];
+  }
   return {
     book,
     bookPlace,
@@ -275,6 +286,8 @@ export async function loadMemorySnapshot(): Promise<import("./types").MemorySnap
     studyTopic,
     startupNorthStar,
     weekBet,
+    nowFocus,
+    interests,
     refusals,
     todayPlan,
     lastRecap,

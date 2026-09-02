@@ -88,19 +88,28 @@ const LOCAL_OPTS = {
   useVad: true,
   telemetryEnabled: false,
   cloudHandoffThreshold: 1_000_000,
+  maxTokens: 2048,
 } as const;
 
 export async function transcribeWav(uri: string): Promise<string> {
   await warmParakeet();
   if (!stt) throw new Error("Parakeet is not loaded");
-  const path = uri.replace(/^file:\/\//, "");
-  const result = await stt.transcribe({
-    audio: path,
-    prompt: "",
-    options: { ...LOCAL_OPTS },
-  });
-  const text = (result.response ?? "").trim();
-  if (!result.success || !text) {
+  const path = decodeURI(uri.replace(/^file:\/\//, ""));
+  let result;
+  try {
+    result = await stt.transcribe({
+      audio: path,
+      options: { ...LOCAL_OPTS },
+    });
+  } catch (e) {
+    const raw = e instanceof Error ? e.message : String(e);
+    const detail = raw.replace(/^Cactus transcribe failed:\s*/i, "").trim();
+    throw new Error(
+      detail || "Parakeet could not read the recording. Hold to talk and try again."
+    );
+  }
+  const text = (result?.response ?? "").trim();
+  if (!result?.success || !text) {
     throw new Error("Parakeet heard nothing. Try again.");
   }
   return text;

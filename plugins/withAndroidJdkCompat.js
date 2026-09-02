@@ -9,6 +9,15 @@ module.exports = function withAndroidJdkCompat(config) {
     const existing = config.modResults.find((item) => item.key === key);
     if (existing) existing.value = value;
     else config.modResults.push({ type: "property", key, value });
+
+    const edge = config.modResults.find((item) => item.key === "edgeToEdgeEnabled");
+    if (edge) edge.value = "false";
+    else
+      config.modResults.push({
+        type: "property",
+        key: "edgeToEdgeEnabled",
+        value: "false",
+      });
     return config;
   });
 };
